@@ -1,8 +1,9 @@
 """Configuration management for Fakelytics platform"""
 
+import json
 from pydantic_settings import BaseSettings
-from pydantic import Field
-from typing import Optional
+from pydantic import Field, field_validator
+from typing import Optional, Any
 from enum import Enum
 
 
@@ -26,10 +27,11 @@ class Settings(BaseSettings):
     API_HOST: str = "0.0.0.0"
     API_PORT: int = 8000
     API_PREFIX: str = "/api/v1"
-    CORS_ORIGINS: list = ["*"]
+    CORS_ORIGINS: list[str] = ["*"]
 
     # API Keys
     API_KEY: str = Field(default="dev-key", min_length=1)
+    API_KEYS: list[str] = Field(default_factory=lambda: ["dev-key"])
     API_KEY_HEADER: str = "X-API-Key"
 
     # Database
@@ -71,10 +73,62 @@ class Settings(BaseSettings):
     PIPELINE_TIMEOUT: int = 30  # seconds per pipeline
     WEBHOOK_TIMEOUT: int = 30  # seconds
     WEBHOOK_RETRIES: int = 5
+    WEBHOOK_SIGNING_SECRET: Optional[str] = None
 
     # Logging
     LOG_LEVEL: str = "INFO"
     LOG_FORMAT: str = "json"
+
+    @field_validator("DEBUG", mode="before")
+    @classmethod
+    def parse_debug(cls, value: Any) -> bool:
+        """Accept common env-style debug values without crashing startup."""
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        normalized = str(value).strip().lower()
+        if normalized in {"1", "true", "t", "yes", "y", "on", "debug"}:
+            return True
+        if normalized in {"0", "false", "f", "no", "n", "off", "release", "prod", "production"}:
+            return False
+        return False
+
+    @field_validator("CORS_ORIGINS", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, value: Any) -> list[str]:
+        """Support list, JSON string list, or comma-separated env values."""
+        if value is None:
+            return ["*"]
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return ["*"]
+            if raw.startswith("["):
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, list):
+                        return [str(item).strip() for item in parsed if str(item).strip()]
+                except json.JSONDecodeError:
+                    pass
+            return [item.strip() for item in raw.split(",") if item.strip()]
+        return ["*"]
+
+    @field_validator("API_KEYS", mode="before")
+    @classmethod
+    def parse_api_keys(cls, value: Any) -> list[str]:
+        """Allow API keys as list or comma-separated string."""
+        if value is None:
+            return ["dev-key"]
+        if isinstance(value, list):
+            parsed = [str(item).strip() for item in value if str(item).strip()]
+            return parsed or ["dev-key"]
+        if isinstance(value, str):
+            parsed = [item.strip() for item in value.split(",") if item.strip()]
+            return parsed or ["dev-key"]
+        return ["dev-key"]
 
     class Config:
         """Pydantic settings configuration"""

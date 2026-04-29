@@ -4,11 +4,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-import logging
 
 from src.core.config.settings import settings
 from src.api.middleware.logging import TraceIDMiddleware, ErrorHandlerMiddleware, app_logger
-from src.api.models.schemas import ErrorResponse, HealthResponse
+from src.api.models.schemas import HealthResponse
 from datetime import datetime
 
 

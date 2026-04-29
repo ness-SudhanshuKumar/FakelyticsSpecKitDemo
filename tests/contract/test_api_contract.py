@@ -27,7 +27,8 @@ def test_verify_endpoint_invalid_url(client):
     """Test verification with invalid URL"""
     response = client.post(
         "/api/v1/verify",
-        json={"url": "not-a-url"}
+        json={"url": "not-a-url"},
+        headers={"X-API-Key": "dev-key"},
     )
     assert response.status_code == 422  # Pydantic validation error
 
@@ -39,7 +40,8 @@ def test_verify_endpoint_structure(client):
     """
     response = client.post(
         "/api/v1/verify",
-        json={"url": "https://example.com"}
+        json={"url": "https://example.com"},
+        headers={"X-API-Key": "dev-key"},
     )
     
     # Should get a response (may be error if extraction fails, but API contract is valid)
@@ -60,3 +62,9 @@ def test_verify_endpoint_structure(client):
             assert "overall_credibility_score" in report
             assert "summary" in report
             assert "findings" in report
+
+
+def test_verify_requires_api_key(client):
+    """Test API key requirement on protected endpoints."""
+    response = client.post("/api/v1/verify", json={"url": "https://example.com"})
+    assert response.status_code == 401

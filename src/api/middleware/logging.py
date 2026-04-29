@@ -7,7 +7,6 @@ from typing import Callable
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 from pythonjsonlogger import jsonlogger
-from io import StringIO
 
 
 # Configure JSON logging

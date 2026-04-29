@@ -1,6 +1,6 @@
 """Pydantic models for API requests and responses"""
 
-from pydantic import BaseModel, Field, HttpUrl, validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 from typing import Optional, List, Dict, Any
 from enum import Enum
 from datetime import datetime
@@ -48,7 +48,8 @@ class VerifyRequest(BaseModel):
     url: str = Field(..., max_length=2048, description="URL to verify")
     options: Optional[RequestOptions] = Field(default_factory=RequestOptions, description="Verification options")
 
-    @validator("url")
+    @field_validator("url")
+    @classmethod
     def validate_url(cls, v):
         """Validate URL format"""
         if not v.startswith(("http://", "https://")):

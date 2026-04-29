@@ -1,249 +1,176 @@
-"""Verification API routes for URL submission and report retrieval"""
+"""Verification API routes for URL submission and report retrieval."""
+
+from __future__ import annotations
 
 import logging
-from uuid import uuid4
-from fastapi import APIRouter, HTTPException, Request, status
-from typing import Optional
+from uuid import UUID, uuid4
 
-from src.api.models.schemas import (
-    VerifyRequest,
-    VerifyResponse,
-    ReportResponse,
-    RequestStatus,
-    ErrorResponse,
-    CredibilityReport,
-    Findings,
-    PipelineResult,
-    Verdict,
-)
-from src.core.extraction.service import extraction_service, ContentExtractionError
-from src.core.storage.inmemory import request_store
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
+
+from src.api.dependencies.security import AuthContext, enforce_rate_limit, require_api_key
+from src.api.models.schemas import ReportResponse, RequestStatus, VerifyRequest, VerifyResponse
 from src.core.config.settings import settings
+from src.core.extraction.service import ContentExtractionError, extraction_service
+from src.core.storage.inmemory import request_store
+from src.services.orchestration import build_credibility_report, post_webhook_result
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/verify", tags=["Verification"])
+router = APIRouter(tags=["Verification"])
 
 
-@router.post("", response_model=VerifyResponse, status_code=status.HTTP_200_OK)
-async def submit_verification(
-    request: Request,
-    verify_request: VerifyRequest,
-) -> VerifyResponse:
-    """
-    Submit a URL for verification
-    
-    **Satisfies**: 
-    - FR-001 (Accept URL and extract content)
-    - FR-007 (Synchronous API with timeout)
-    - FR-008 (Asynchronous callbacks via webhooks)
-    - US-1 (URL-Based Verification)
-    - US-2 (API Integration)
-    
-    **Spec Section**: API Contract POST /verify
-    
-    **Assumptions**:
-    - URL is already validated by Pydantic
-    - Content extraction completes within timeout
-    - Report generation is synchronous for MVP
-    
-    **Returns**:
-    - 200: Report completed immediately (sync mode)
-    - 202: Verification queued (async mode)
-    """
-    trace_id = getattr(request.state, "trace_id", "unknown")
-    request_id = uuid4()
+async def _run_verification(request_id: UUID, url: str):
+    """Run extraction + orchestration and persist report status."""
+    request_store.update_status(request_id, RequestStatus.PROCESSING)
+    content = await extraction_service.extract(url)
+    report = await build_credibility_report(request_id=request_id, url=url, content=content)
+    request_store.set_report(request_id, report)
+    return report
 
+
+async def _process_async_request(request_id: UUID, url: str, webhook_url: str | None) -> None:
+    """Background async flow for verification + optional webhook callback."""
     try:
-        logger.info(
-            "Verification request received",
-            extra={
-                "trace_id": trace_id,
-                "request_id": str(request_id),
-                "url": verify_request.url,
-                "async_mode": verify_request.options.async_mode if verify_request.options else False,
-            }
-        )
-
-        # Create request record
-        options = verify_request.options or {}
-        webhook_url = options.webhook_url if hasattr(options, 'webhook_url') else None
-        async_mode = options.async_mode if hasattr(options, 'async_mode') else False
-
-        request_store.create_request(
-            request_id=request_id,
-            url=verify_request.url,
-            async_mode=async_mode,
-            webhook_url=str(webhook_url) if webhook_url else None,
-        )
-
-        # For MVP: Process synchronously
-        # Extract content from URL
-        try:
-            logger.info(f"Extracting content from {verify_request.url}")
-            content = await extraction_service.extract(verify_request.url)
-        except ContentExtractionError as e:
-            logger.error(f"Content extraction failed: {str(e)}")
-            request_store.set_error(request_id, str(e))
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "error": "extraction_failed",
-                    "message": f"Failed to extract content: {str(e)}",
-                }
+        report = await _run_verification(request_id=request_id, url=url)
+        if webhook_url:
+            await post_webhook_result(
+                webhook_url=webhook_url,
+                request_id=request_id,
+                status=RequestStatus.COMPLETED.value,
+                report=report,
+            )
+    except Exception as exc:
+        logger.error("Async verification failed", extra={"request_id": str(request_id), "error": str(exc)})
+        request_store.set_error(request_id, str(exc))
+        if webhook_url:
+            await post_webhook_result(
+                webhook_url=webhook_url,
+                request_id=request_id,
+                status=RequestStatus.FAILED.value,
+                error_message=str(exc),
             )
 
-        # Generate report (MVP: simple mock report)
-        # In production, this would invoke pipelines in parallel
-        report = _generate_mock_report(request_id, verify_request.url, content)
 
-        # Store report
-        request_store.set_report(request_id, report)
+@router.post("/verify", response_model=VerifyResponse, status_code=status.HTTP_200_OK)
+async def submit_verification(
+    request: Request,
+    response: Response,
+    background_tasks: BackgroundTasks,
+    verify_request: VerifyRequest,
+    auth: AuthContext = Depends(require_api_key),
+) -> VerifyResponse:
+    """
+    Submit a URL for verification.
 
-        logger.info(
-            "Verification completed",
-            extra={
-                "trace_id": trace_id,
-                "request_id": str(request_id),
-                "credibility_score": report.overall_credibility_score,
-            }
+    - Sync mode (default): returns 200 + completed report.
+    - Async mode: returns 202 + request_id and optional webhook callback on completion.
+    """
+    enforce_rate_limit(response=response, auth=auth, endpoint="/verify")
+
+    trace_id = getattr(request.state, "trace_id", "unknown")
+    request_id = uuid4()
+    options = verify_request.options
+    async_mode = bool(options.async_mode if options else False)
+    webhook_url = str(options.webhook_url) if options and options.webhook_url else None
+
+    request_data = request_store.create_request(
+        request_id=request_id,
+        url=verify_request.url,
+        async_mode=async_mode,
+        webhook_url=webhook_url,
+    )
+
+    logger.info(
+        "Verification request received",
+        extra={
+            "trace_id": trace_id,
+            "request_id": str(request_id),
+            "url": verify_request.url,
+            "async_mode": async_mode,
+        },
+    )
+
+    if async_mode and settings.ENABLE_ASYNC_MODE:
+        request_store.update_status(request_id, RequestStatus.PROCESSING)
+        background_tasks.add_task(
+            _process_async_request,
+            request_id=request_id,
+            url=verify_request.url,
+            webhook_url=webhook_url if settings.ENABLE_WEBHOOKS else None,
+        )
+        response.status_code = status.HTTP_202_ACCEPTED
+        return VerifyResponse(
+            request_id=request_id,
+            status=RequestStatus.PROCESSING,
+            report=None,
+            created_at=request_data["created_at"],
+            completed_at=None,
         )
 
+    try:
+        report = await _run_verification(request_id=request_id, url=verify_request.url)
+        latest = request_store.get_request(request_id)
         return VerifyResponse(
             request_id=request_id,
             status=RequestStatus.COMPLETED,
             report=report,
+            created_at=latest["created_at"] if latest else request_data["created_at"],
+            completed_at=latest["completed_at"] if latest else None,
         )
-
-    except HTTPException:
-        raise
-    except Exception as e:
+    except ContentExtractionError as exc:
+        request_store.set_error(request_id, str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "extraction_failed", "message": f"Failed to extract content: {str(exc)}"},
+        )
+    except Exception as exc:
+        request_store.set_error(request_id, str(exc))
         logger.error(
             "Verification failed with exception",
-            extra={
-                "trace_id": trace_id,
-                "request_id": str(request_id),
-                "exception": str(e),
-            },
-            exc_info=True
+            extra={"trace_id": trace_id, "request_id": str(request_id), "exception": str(exc)},
+            exc_info=True,
         )
-        request_store.set_error(request_id, str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "error": "verification_failed",
-                "message": "An error occurred during verification",
-            }
+            detail={"error": "verification_failed", "message": "An error occurred during verification"},
         )
 
 
-def _generate_mock_report(request_id, url: str, content) -> CredibilityReport:
-    """
-    Generate a mock report for MVP
-    
-    **TODO**: Replace with actual pipeline execution
-    """
-    from datetime import datetime
-
-    # Mock findings for MVP
-    findings = Findings(
-        text=PipelineResult(
-            verdict=Verdict.SUPPORTED if len(content.text_content) > 100 else Verdict.UNVERIFIABLE,
-            confidence=75,
-            findings=[]
-        ),
-        image=PipelineResult(
-            verdict=Verdict.UNVERIFIABLE if len(content.images) == 0 else Verdict.DISPUTED,
-            confidence=50 if content.images else 0,
-            findings=[]
-        ) if content.images else None,
-        audio_video=None,
-        spam=PipelineResult(
-            verdict=Verdict.SUPPORTED,
-            confidence=85,
-            findings=[]
-        ),
-    )
-
-    # Calculate overall score (mock)
-    scores = [
-        findings.text.confidence,
-        findings.spam.confidence,
-    ]
-    if findings.image:
-        scores.append(findings.image.confidence)
-
-    overall_score = int(sum(scores) / len(scores)) if scores else 50
-
-    return CredibilityReport(
-        request_id=request_id,
-        url=url,
-        overall_credibility_score=overall_score,
-        summary=f"Mock report: Content extracted with {len(content.text_content)} chars, "
-                f"{len(content.images)} images, {len(content.audio)} audio, {len(content.video)} video",
-        findings=findings,
-        timestamp=datetime.utcnow(),
-    )
-
-
-@router.get("/{request_id}", response_model=ReportResponse, status_code=status.HTTP_200_OK)
+@router.get("/report/{request_id}", response_model=ReportResponse, status_code=status.HTTP_200_OK)
+@router.get("/verify/{request_id}", response_model=ReportResponse, include_in_schema=False)
 async def get_report(
     request: Request,
+    response: Response,
     request_id: str,
+    auth: AuthContext = Depends(require_api_key),
 ) -> ReportResponse:
-    """
-    Retrieve verification report by request ID
-    
-    **Satisfies**:
-    - FR-007 (Report retrieval endpoint)
-    - US-2 (API Integration)
-    
-    **Spec Section**: API Contract GET /report/{request_id}
-    
-    **Returns**:
-    - 200: Report retrieved successfully
-    - 202: Still processing
-    - 404: Report not found
-    """
-    trace_id = getattr(request.state, "trace_id", "unknown")
+    """Retrieve verification report by request ID."""
+    enforce_rate_limit(response=response, auth=auth, endpoint="/report")
 
-    logger.info(
-        "Report retrieval requested",
-        extra={
-            "trace_id": trace_id,
-            "request_id": request_id,
-        }
-    )
+    trace_id = getattr(request.state, "trace_id", "unknown")
+    logger.info("Report retrieval requested", extra={"trace_id": trace_id, "request_id": request_id})
 
     try:
-        from uuid import UUID
         request_uuid = UUID(request_id)
     except ValueError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "error": "invalid_request_id",
-                "message": "Invalid request ID format",
-            }
+            detail={"error": "invalid_request_id", "message": "Invalid request ID format"},
         )
 
     request_data = request_store.get_request(request_uuid)
-
     if not request_data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "error": "not_found",
-                "message": "Request not found",
-            }
+            detail={"error": "not_found", "message": "Request not found"},
         )
 
-    status_code = status.HTTP_200_OK
-    if request_data["status"] == RequestStatus.PROCESSING:
-        status_code = status.HTTP_202_ACCEPTED
+    if request_data["status"] in {RequestStatus.PENDING, RequestStatus.PROCESSING}:
+        response.status_code = status.HTTP_202_ACCEPTED
 
     return ReportResponse(
         request_id=request_uuid,
         status=request_data["status"],
         report=request_data["report"],
     )
+

@@ -7,11 +7,8 @@ from datetime import datetime
 from threading import Lock
 
 from src.api.models.schemas import (
-    VerifyRequest,
     CredibilityReport,
     RequestStatus,
-    Findings,
-    PipelineResult,
 )
 
 logger = logging.getLogger(__name__)
