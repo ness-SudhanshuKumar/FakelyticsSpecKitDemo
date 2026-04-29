@@ -21,9 +21,21 @@ VERDICT_FACTORS: Dict[Verdict, float] = {
 }
 
 
+def _normalize_verdict(verdict: Verdict | str) -> Verdict:
+    """Normalize enum/string verdict values into Verdict enum."""
+    if isinstance(verdict, Verdict):
+        return verdict
+    normalized = str(verdict).strip().lower()
+    if normalized == "supported":
+        return Verdict.SUPPORTED
+    if normalized == "disputed":
+        return Verdict.DISPUTED
+    return Verdict.UNVERIFIABLE
+
+
 def _pipeline_score(result: PipelineResult) -> float:
     """Project a pipeline result into a normalized score."""
-    factor = VERDICT_FACTORS.get(result.verdict, 0.6)
+    factor = VERDICT_FACTORS.get(_normalize_verdict(result.verdict), 0.6)
     return max(0.0, min(100.0, result.confidence * factor))
 
 
@@ -60,10 +72,11 @@ def generate_human_summary(findings: Findings, overall_score: int) -> str:
         result = getattr(findings, key)
         if result is None:
             continue
-        active.append(f"{key}:{result.verdict.value}({result.confidence})")
-        if result.verdict == Verdict.DISPUTED:
+        verdict = _normalize_verdict(result.verdict)
+        active.append(f"{key}:{verdict.value}({result.confidence})")
+        if verdict == Verdict.DISPUTED:
             disputed.append(key)
-        elif result.verdict == Verdict.SUPPORTED:
+        elif verdict == Verdict.SUPPORTED:
             supported.append(key)
         else:
             unverifiable.append(key)
@@ -82,4 +95,3 @@ def generate_human_summary(findings: Findings, overall_score: int) -> str:
         f"{lead} Overall credibility score: {overall_score}/100. "
         f"Pipeline verdicts: {', '.join(active)}."
     )
-
