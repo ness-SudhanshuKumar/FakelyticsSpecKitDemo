@@ -1,0 +1,409 @@
+openapi: 3.0.3
+info:
+  title: Fakelytics API
+  description: |
+    Unified multimodal content verification API. Submit a URL and receive a comprehensive credibility report with findings from text, image, audio/video, and spam detection pipelines.
+    
+    ## Authentication
+    All endpoints require an API key in the `X-API-Key` header.
+    
+    ## Rate Limits
+    - Free tier: 100 requests/day
+    - Pro tier: 10,000 requests/day
+    - Enterprise: Custom quotas
+    
+    ## Webhooks
+    For async processing, provide a `webhook_url` in the request. The API will POST the complete report to your endpoint when ready.
+  version: 1.0.0
+  contact:
+    name: Fakelytics Support
+    url: https://fakelytics.io/support
+  license:
+    name: Proprietary
+    url: https://fakelytics.io/license
+
+servers:
+  - url: https://api.fakelytics.io/v1
+    description: Production server
+  - url: https://staging-api.fakelytics.io/v1
+    description: Staging server
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: Verification
+    description: URL verification endpoints
+  - name: Reports
+    description: Report retrieval endpoints
+  - name: Webhooks
+    description: Webhook management
+
+paths:
+  /verify:
+    post:
+      tags:
+        - Verification
+      summary: Submit URL for verification
+      description: |
+        Submit a URL for comprehensive credibility analysis.
+        Returns immediately with a request ID for async processing,
+        or waits for completion in sync mode (default).
+      operationId: submitVerification
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyRequest'
+            examples:
+              sync_request:
+                summary: Synchronous request
+                value:
+                  url: "https://example.com/article"
+              async_request:
+                summary: Asynchronous request with webhook
+                value:
+                  url: "https://example.com/article"
+                  options:
+                    async_mode: true
+                    webhook_url: "https://your-app.com/webhooks/fakelytics"
+      responses:
+        '200':
+          description: Verification completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerifyResponse'
+        '202':
+          description: Verification queued (async mode)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerifyResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /report/{request_id}:
+    get:
+      tags:
+        - Reports
+      summary: Retrieve verification report
+      description: Retrieve a previously submitted verification report by request ID.
+      operationId: getReport
+      parameters:
+        - name: request_id
+          in: path
+          required: true
+          description: The request ID returned from /verify
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Report retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportResponse'
+        '404':
+          description: Report not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+
+  /webhook:
+    post:
+      tags:
+        - Webhooks
+      summary: Webhook callback endpoint
+      description: |
+        Endpoint for receiving async verification results.
+        This endpoint is called by the Fakelytics API when async verification completes.
+      operationId: webhookCallback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookPayload'
+      responses:
+        '200':
+          description: Webhook received successfully
+        '400':
+          description: Invalid webhook payload
+
+  /health:
+    get:
+      tags:
+        - Health
+      summary: Health check
+      description: Check API health status
+      operationId: healthCheck
+      responses:
+        '200':
+          description: API is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: |
+        API key authentication. Include your API key in the `X-API-Key` header.
+        Get your API key from the dashboard at https://dashboard.fakelytics.io
+
+  schemas:
+    VerifyRequest:
+      type: object
+      required:
+        - url
+      properties:
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+          description: URL to verify
+          example: "https://example.com/article"
+        options:
+          $ref: '#/components/schemas/RequestOptions'
+
+    RequestOptions:
+      type: object
+      properties:
+        async_mode:
+          type: boolean
+          default: false
+          description: Run verification asynchronously
+        webhook_url:
+          type: string
+          format: uri
+          description: Callback URL for async results
+          example: "https://your-app.com/webhooks/fakelytics"
+        timeout_seconds:
+          type: integer
+          minimum: 10
+          maximum: 300
+          default: 60
+          description: Maximum processing time in seconds
+        pipelines:
+          type: array
+          items:
+            type: string
+            enum: [text, image, audio_video, spam]
+          description: Which pipelines to run (default: all)
+
+    VerifyResponse:
+      type: object
+      properties:
+        request_id:
+          type: string
+          format: uuid
+          description: Unique request identifier
+        status:
+          type: string
+          enum: [pending, processing, completed, failed]
+          description: Current status of the verification
+        report:
+          $ref: '#/components/schemas/CredibilityReport'
+        created_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+
+    ReportResponse:
+      type: object
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending, processing, completed, failed]
+        report:
+          $ref: '#/components/schemas/CredibilityReport'
+
+    CredibilityReport:
+      type: object
+      required:
+        - request_id
+        - url
+        - overall_credibility_score
+        - summary
+        - findings
+        - timestamp
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        url:
+          type: string
+          format: uri
+        overall_credibility_score:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Overall credibility score (0-100)
+        summary:
+          type: string
+          description: Human-readable summary of findings
+        findings:
+          $ref: '#/components/schemas/Findings'
+        timestamp:
+          type: string
+          format: date-time
+
+    Findings:
+      type: object
+      properties:
+        text:
+          $ref: '#/components/schemas/PipelineResult'
+        image:
+          $ref: '#/components/schemas/PipelineResult'
+        audio_video:
+          $ref: '#/components/schemas/PipelineResult'
+        spam:
+          $ref: '#/components/schemas/PipelineResult'
+
+    PipelineResult:
+      type: object
+      required:
+        - verdict
+        - confidence
+        - findings
+      properties:
+        verdict:
+          type: string
+          enum: [Supported, Disputed, Unverifiable]
+        confidence:
+          type: integer
+          minimum: 0
+          maximum: 100
+        findings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Finding'
+
+    Finding:
+      type: object
+      required:
+        - id
+        - summary
+        - verdict
+        - confidence
+        - evidence
+      properties:
+        id:
+          type: string
+          format: uuid
+        summary:
+          type: string
+          description: Brief description of the finding
+        verdict:
+          type: string
+          enum: [Supported, Disputed, Unverifiable]
+        confidence:
+          type: integer
+          minimum: 0
+          maximum: 100
+        evidence:
+          type: array
+          items:
+            $ref: '#/components/schemas/Evidence'
+        details:
+          type: object
+          description: Pipeline-specific additional data
+
+    Evidence:
+      type: object
+      required:
+        - url
+        - snippet
+      properties:
+        url:
+          type: string
+          format: uri
+        snippet:
+          type: string
+        title:
+          type: string
+        validated:
+          type: boolean
+
+    WebhookPayload:
+      type: object
+      required:
+        - request_id
+        - status
+        - report
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [completed, failed]
+        report:
+          $ref: '#/components/schemas/CredibilityReport'
+        error_message:
+          type: string
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+        - message
+      properties:
+        error:
+          type: string
+          description: Error code
+        message:
+          type: string
+          description: Human-readable error message
+        details:
+          type: object
+          description: Additional error details
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+        version:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
