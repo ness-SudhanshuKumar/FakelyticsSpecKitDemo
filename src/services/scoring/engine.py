@@ -84,7 +84,9 @@ def generate_human_summary(findings: Findings, overall_score: int) -> str:
     if not active:
         return "No analyzable evidence was available for this URL."
 
-    if disputed:
+    if overall_score < 40:
+        lead = "Available signals are weak or inconclusive, so this report should not be treated as verified."
+    elif disputed:
         lead = f"Potential misinformation signals detected in {', '.join(disputed)} analysis."
     elif supported:
         lead = f"Content appears broadly credible based on {', '.join(supported)} analysis."

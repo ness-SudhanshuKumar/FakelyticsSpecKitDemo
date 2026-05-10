@@ -33,6 +33,7 @@ venv/
 env/
 ENV/
 .venv
+.venv-wsl/
 env.bak/
 venv.bak/
 

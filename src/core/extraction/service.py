@@ -1,14 +1,24 @@
 """Content extraction service for fetching and extracting content from URLs"""
 
 import asyncio
+import hashlib
+import ipaddress
+import json
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 import aiohttp
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
+
+try:
+    import trafilatura
+    TRAFILATURA_AVAILABLE = True
+except ImportError:
+    trafilatura = None
+    TRAFILATURA_AVAILABLE = False
 
 from src.core.config.settings import settings
 
@@ -22,7 +32,10 @@ class MediaItem:
     media_type: str  # 'image', 'audio', 'video'
     title: Optional[str] = None
     local_path: Optional[str] = None
+    storage_path: Optional[str] = None
+    content_type: Optional[str] = None
     size_bytes: Optional[int] = None
+    download_error: Optional[str] = None
     extracted_at: datetime = field(default_factory=datetime.utcnow)
 
 
@@ -69,6 +82,12 @@ class ContentExtractionService:
     IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp'}
     AUDIO_EXTENSIONS = {'.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac'}
     VIDEO_EXTENSIONS = {'.mp4', '.webm', '.mov', '.avi', '.mkv', '.flv', '.m3u8'}
+    MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
+    MEDIA_CONTENT_PREFIXES = {
+        "image": ("image/",),
+        "audio": ("audio/",),
+        "video": ("video/", "application/vnd.apple.mpegurl"),
+    }
 
     # Headers to mimic browser
     DEFAULT_HEADERS = {
@@ -80,7 +99,7 @@ class ContentExtractionService:
         self.timeout = aiohttp.ClientTimeout(total=settings.CONTENT_EXTRACTION_TIMEOUT)
         self.max_content_size = settings.MAX_CONTENT_SIZE
         self.media_dir = Path(settings.DOWNLOADED_MEDIA_DIR)
-        self.media_dir.mkdir(exist_ok=True)
+        self.media_dir.mkdir(parents=True, exist_ok=True)
 
     async def extract(self, url: str) -> ContentExtract:
         """
@@ -110,6 +129,9 @@ class ContentExtractionService:
 
         # Parse content
         extract = await self._parse_content(url, html_content)
+
+        if settings.DOWNLOAD_EXTRACTED_MEDIA:
+            await self._download_extracted_media(extract)
         
         logger.info(f"Successfully extracted content from {url}")
         return extract
@@ -123,9 +145,6 @@ class ContentExtractionService:
         if not isinstance(url, str):
             raise URLValidationError("URL must be a string")
 
-        if not url.startswith(("http://", "https://")):
-            raise URLValidationError("URL must start with http:// or https://")
-
         if len(url) > 2048:
             raise URLValidationError("URL too long (max 2048 characters)")
 
@@ -135,16 +154,37 @@ class ContentExtractionService:
         except Exception as e:
             raise URLValidationError(f"Invalid URL format: {str(e)}")
 
-        # Check for private IPs (basic check)
+        if parsed.scheme not in {"http", "https"}:
+            raise URLValidationError("URL must start with http:// or https://")
+
         hostname = parsed.hostname
-        if hostname:
-            # Block common private IP patterns
-            private_patterns = [
-                '127.', '192.168.', '10.', '172.16.', '172.17.',
-                'localhost', '0.0.0.0'
-            ]
-            if any(hostname.startswith(p) for p in private_patterns):
-                raise URLValidationError("URLs to private IP addresses are blocked")
+        if not hostname:
+            raise URLValidationError("URL must include a valid hostname")
+
+        if parsed.username or parsed.password:
+            raise URLValidationError("URLs with embedded credentials are blocked")
+
+        if hostname.lower() in {"localhost", "localhost.localdomain"}:
+            raise URLValidationError("URLs to private hosts are blocked")
+
+        try:
+            ip = ipaddress.ip_address(hostname.strip("[]"))
+        except ValueError:
+            if "." not in hostname:
+                raise URLValidationError("URL must include a fully qualified domain name")
+            return
+
+        if any(
+            (
+                ip.is_private,
+                ip.is_loopback,
+                ip.is_link_local,
+                ip.is_multicast,
+                ip.is_reserved,
+                ip.is_unspecified,
+            )
+        ):
+            raise URLValidationError("URLs to private or reserved IP addresses are blocked")
 
     async def _fetch_url(self, url: str, max_retries: int = 3) -> str:
         """
@@ -196,8 +236,8 @@ class ContentExtractionService:
         try:
             soup = BeautifulSoup(html_content, 'html.parser')
 
-            # Extract text content
-            extract.text_content = self._extract_text(soup)
+            # Extract main article text first; fall back to broad page text.
+            extract.text_content = self._extract_text(soup, html_content)
 
             # Extract media URLs
             extract.images = self._extract_images(soup, url)
@@ -210,25 +250,192 @@ class ContentExtractionService:
 
         return extract
 
-    def _extract_text(self, soup: BeautifulSoup) -> str:
+    def _extract_text(self, soup: BeautifulSoup, html_content: str = "") -> str:
         """
-        Extract text content from HTML
+        Extract main article text from HTML.
         
         **Satisfies**: T-301 (Extract text and clean HTML tags)
         """
-        # Remove script and style elements
-        for script in soup(["script", "style"]):
-            script.decompose()
+        article_text = self._extract_article_text(html_content, soup)
+        if article_text:
+            return article_text[:10000]
 
-        # Get text
-        text = soup.get_text()
+        return self._extract_page_text_fallback(soup)[:10000]
 
-        # Clean up text
+    def _extract_article_text(self, html_content: str, soup: BeautifulSoup) -> str:
+        """Extract the central article body using trafilatura, JSON-LD, and semantic tags."""
+        if TRAFILATURA_AVAILABLE and html_content:
+            try:
+                extracted = trafilatura.extract(
+                    html_content,
+                    include_comments=False,
+                    include_tables=False,
+                    favor_precision=True,
+                )
+                cleaned = self._normalize_extracted_text(extracted or "")
+                if self._is_substantive_article_text(cleaned):
+                    logger.info("Extracted main article text with trafilatura", extra={"length": len(cleaned)})
+                    return cleaned
+            except Exception as exc:
+                logger.warning("Trafilatura extraction failed", extra={"error": str(exc)})
+
+        json_ld_text = self._extract_json_ld_article_text(soup)
+        if self._is_substantive_article_text(json_ld_text):
+            logger.info("Extracted main article text from JSON-LD", extra={"length": len(json_ld_text)})
+            return json_ld_text
+
+        semantic_text = self._extract_semantic_article_text(soup)
+        if self._is_substantive_article_text(semantic_text):
+            logger.info("Extracted main article text from semantic HTML", extra={"length": len(semantic_text)})
+            return semantic_text
+
+        return ""
+
+    def _extract_json_ld_article_text(self, soup: BeautifulSoup) -> str:
+        """Extract NewsArticle/Article headline and body from JSON-LD metadata."""
+        candidates: List[str] = []
+        for script in soup.find_all("script", type="application/ld+json"):
+            raw = script.string or script.get_text()
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            for item in self._iter_json_ld_items(data):
+                item_type = item.get("@type", "")
+                item_types = item_type if isinstance(item_type, list) else [item_type]
+                normalized_types = {str(value).lower() for value in item_types}
+                if not normalized_types.intersection({"article", "newsarticle", "blogposting"}):
+                    continue
+
+                parts = [
+                    item.get("headline"),
+                    item.get("description"),
+                    item.get("articleBody"),
+                ]
+                text = self._normalize_extracted_text(" ".join(str(part) for part in parts if part))
+                if text:
+                    candidates.append(text)
+
+        return max(candidates, key=len, default="")
+
+    def _iter_json_ld_items(self, data):
+        """Yield JSON-LD objects, including graph members."""
+        if isinstance(data, list):
+            for item in data:
+                yield from self._iter_json_ld_items(item)
+        elif isinstance(data, dict):
+            yield data
+            graph = data.get("@graph")
+            if isinstance(graph, list):
+                for item in graph:
+                    yield from self._iter_json_ld_items(item)
+
+    def _extract_semantic_article_text(self, soup: BeautifulSoup) -> str:
+        """Extract text from article-like containers after removing page chrome."""
+        working = BeautifulSoup(str(soup), "html.parser")
+        self._remove_non_article_elements(working)
+
+        selectors = [
+            "article",
+            "main",
+            "[role='main']",
+            ".article",
+            ".story",
+            ".story-content",
+            ".article-content",
+            ".post-content",
+            ".entry-content",
+            ".content-body",
+        ]
+        candidates = []
+        for selector in selectors:
+            for node in working.select(selector):
+                text = self._text_from_article_node(node)
+                if text:
+                    candidates.append(text)
+
+        return max(candidates, key=len, default="")
+
+    def _extract_page_text_fallback(self, soup: BeautifulSoup) -> str:
+        """Extract broad page text after removing common chrome and ad regions."""
+        working = BeautifulSoup(str(soup), "html.parser")
+        self._remove_non_article_elements(working)
+        return self._normalize_extracted_text(working.get_text(" "))
+
+    def _remove_non_article_elements(self, soup: BeautifulSoup) -> None:
+        """Remove navigation, ads, suggestions, and non-content elements."""
+        for node in soup([
+            "script",
+            "style",
+            "noscript",
+            "nav",
+            "footer",
+            "header",
+            "aside",
+            "form",
+            "iframe",
+            "svg",
+        ]):
+            node.decompose()
+
+        noise_terms = (
+            "ad",
+            "advert",
+            "breadcrumb",
+            "carousel",
+            "comment",
+            "footer",
+            "menu",
+            "nav",
+            "promo",
+            "recommend",
+            "related",
+            "share",
+            "sidebar",
+            "social",
+            "subscribe",
+            "suggest",
+            "trending",
+        )
+        for node in soup.find_all(True):
+            marker = " ".join(
+                str(value).lower()
+                for value in [
+                    node.get("id", ""),
+                    " ".join(node.get("class", [])),
+                    node.get("role", ""),
+                    node.get("aria-label", ""),
+                ]
+            )
+            if any(term in marker for term in noise_terms):
+                node.decompose()
+
+    def _text_from_article_node(self, node) -> str:
+        """Return normalized headline/paragraph text from a candidate article node."""
+        parts = []
+        for child in node.find_all(["h1", "h2", "p"], recursive=True):
+            text = self._normalize_extracted_text(child.get_text(" "))
+            if len(text) >= 25 or child.name in {"h1", "h2"}:
+                parts.append(text)
+        if not parts:
+            return self._normalize_extracted_text(node.get_text(" "))
+        return self._normalize_extracted_text(" ".join(parts))
+
+    def _normalize_extracted_text(self, text: str) -> str:
+        """Normalize extracted article text."""
+        if not text:
+            return ""
+
         lines = (line.strip() for line in text.splitlines())
         chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        text = ' '.join(chunk for chunk in chunks if chunk)
+        return ' '.join(chunk for chunk in chunks if chunk)
 
-        return text[:10000]  # Limit to first 10k chars for now
+    def _is_substantive_article_text(self, text: str) -> bool:
+        """Check whether extracted text is article-like enough to trust."""
+        words = text.split()
+        return len(words) >= 25 and len(text) >= 160
 
     def _extract_images(self, soup: BeautifulSoup, base_url: str) -> List[MediaItem]:
         """Extract image URLs"""
@@ -251,6 +458,13 @@ class ContentExtractionService:
         
         # Find audio tags
         for audio in soup.find_all('audio', limit=20):
+            src = audio.get('src')
+            if src:
+                audio_items.append(MediaItem(
+                    url=urljoin(base_url, src),
+                    media_type='audio',
+                    title=audio.get('title', 'Audio')
+                ))
             for source in audio.find_all('source'):
                 src = source.get('src')
                 if src:
@@ -269,6 +483,13 @@ class ContentExtractionService:
         
         # Find video tags
         for video in soup.find_all('video', limit=20):
+            src = video.get('src')
+            if src:
+                videos.append(MediaItem(
+                    url=urljoin(base_url, src),
+                    media_type='video',
+                    title=video.get('title', 'Video')
+                ))
             for source in video.find_all('source'):
                 src = source.get('src')
                 if src:
@@ -290,6 +511,82 @@ class ContentExtractionService:
                 ))
         
         return videos
+
+    async def _download_extracted_media(self, extract: ContentExtract) -> None:
+        """Download a bounded number of extracted media assets to local object-store style paths."""
+        media_items = (extract.images + extract.audio + extract.video)[: settings.MEDIA_DOWNLOAD_LIMIT]
+        if not media_items:
+            return
+
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            await asyncio.gather(
+                *(self.download_media_item(session, item) for item in media_items),
+                return_exceptions=True,
+            )
+
+    async def download_media_item(self, session: aiohttp.ClientSession, item: MediaItem) -> MediaItem:
+        """Download and validate one media item.
+
+        The MVP stores files locally under DOWNLOADED_MEDIA_DIR while exposing a stable
+        ``storage_path`` that mirrors the object key shape expected from S3-backed storage.
+        """
+        try:
+            self._validate_url(item.url)
+            extension = self._extension_for_url(item.url)
+            if extension not in self._extensions_for_type(item.media_type):
+                raise ContentFetchError(f"Unsupported {item.media_type} file type")
+
+            async with session.get(item.url, headers=self.DEFAULT_HEADERS, ssl=False) as response:
+                if response.status >= 400:
+                    raise ContentFetchError(f"HTTP {response.status}")
+
+                content_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
+                if content_type and not self._content_type_matches(item.media_type, content_type):
+                    raise ContentFetchError(f"Unexpected content type: {content_type}")
+
+                content_length = response.headers.get("Content-Length")
+                if content_length and int(content_length) > settings.MAX_MEDIA_FILE_SIZE:
+                    raise ContentFetchError("Media file exceeds size limit")
+
+                data = await response.read()
+                if len(data) > settings.MAX_MEDIA_FILE_SIZE:
+                    raise ContentFetchError("Media file exceeds size limit")
+                if not data:
+                    raise ContentFetchError("Media file is empty")
+
+            digest = hashlib.sha256(item.url.encode("utf-8")).hexdigest()[:20]
+            media_dir = self.media_dir / item.media_type
+            media_dir.mkdir(parents=True, exist_ok=True)
+            file_path = media_dir / f"{digest}{extension}"
+            file_path.write_bytes(data)
+
+            item.local_path = str(file_path)
+            item.storage_path = f"media/{item.media_type}/{file_path.name}"
+            item.content_type = content_type or None
+            item.size_bytes = len(data)
+            item.download_error = None
+        except Exception as exc:
+            item.download_error = str(exc)
+            logger.warning("Media download failed", extra={"url": item.url, "error": item.download_error})
+
+        return item
+
+    def _extension_for_url(self, url: str) -> str:
+        """Return lowercase extension from a media URL path."""
+        return Path(urlparse(url).path).suffix.lower()
+
+    def _extensions_for_type(self, media_type: str) -> set[str]:
+        if media_type == "image":
+            return self.IMAGE_EXTENSIONS
+        if media_type == "audio":
+            return self.AUDIO_EXTENSIONS
+        if media_type == "video":
+            return self.VIDEO_EXTENSIONS
+        return set()
+
+    def _content_type_matches(self, media_type: str, content_type: str) -> bool:
+        prefixes = self.MEDIA_CONTENT_PREFIXES.get(media_type, ())
+        return any(content_type.startswith(prefix) for prefix in prefixes)
 
 
 # Global instance

@@ -18,6 +18,11 @@ from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
 from enum import Enum
 from abc import ABC, abstractmethod
+from urllib.parse import urlparse
+
+import httpx
+
+from src.core.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +222,116 @@ class MockFactCheckProvider(FactCheckSearchProvider):
         # Default: unverifiable (no sources found)
         self.logger.info(f"Mock search found no match for: {claim}")
         return []
+
+
+class SerperFactCheckProvider(FactCheckSearchProvider):
+    """Fact-check evidence provider backed by Serper Google Search results."""
+
+    HIGH_RELIABILITY_DOMAINS = {
+        "apnews.com",
+        "bbc.com",
+        "bbc.co.uk",
+        "factcheck.org",
+        "fullfact.org",
+        "pib.gov.in",
+        "reuters.com",
+        "snopes.com",
+        "thehindu.com",
+        "wikipedia.org",
+    }
+
+    def __init__(
+        self,
+        api_key: str,
+        endpoint: str = "https://google.serper.dev/search",
+        num_results: int = 5,
+        gl: str = "in",
+        hl: str = "en",
+    ):
+        """Initialize Serper provider."""
+        self.api_key = api_key
+        self.endpoint = endpoint
+        self.num_results = max(1, min(10, int(num_results)))
+        self.gl = gl
+        self.hl = hl
+        self.logger = logger
+
+    async def search(self, claim: str, timeout: int = 10) -> List[Evidence]:
+        """Search Serper for evidence candidates about a claim."""
+        if not self.api_key:
+            return []
+
+        self.logger.info(
+            "Starting Serper search",
+            extra={
+                "claim": claim[:160],
+                "endpoint": self.endpoint,
+                "num_results": self.num_results,
+                "gl": self.gl,
+                "hl": self.hl,
+            },
+        )
+
+        payload = {
+            "q": claim,
+            "num": self.num_results,
+            "gl": self.gl,
+            "hl": self.hl,
+        }
+        headers = {
+            "X-API-KEY": self.api_key,
+            "Content-Type": "application/json",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(self.endpoint, headers=headers, json=payload)
+                response.raise_for_status()
+                evidence = self._parse_results(response.json())
+                self.logger.info(
+                    "Serper search completed",
+                    extra={"claim": claim[:160], "evidence_count": len(evidence)},
+                )
+                return evidence
+        except Exception as exc:
+            self.logger.warning("Serper search failed", extra={"claim": claim, "error": str(exc)})
+            return []
+
+    def _parse_results(self, data: Dict[str, Any]) -> List[Evidence]:
+        """Convert Serper response data into evidence records."""
+        evidence: List[Evidence] = []
+        for item in data.get("organic", [])[: self.num_results]:
+            url = item.get("link") or item.get("url")
+            snippet = item.get("snippet") or item.get("description")
+            title = item.get("title")
+            if not url or not snippet:
+                continue
+
+            source = item.get("source") or self._source_from_url(url)
+            evidence.append(
+                Evidence(
+                    url=url,
+                    snippet=snippet,
+                    source=source,
+                    title=title,
+                    published_date=item.get("date"),
+                    reliability_score=self._reliability_for_url(url),
+                )
+            )
+
+        return evidence
+
+    def _source_from_url(self, url: str) -> str:
+        hostname = urlparse(url).hostname or "Web Search"
+        return hostname.removeprefix("www.")
+
+    def _reliability_for_url(self, url: str) -> float:
+        hostname = (urlparse(url).hostname or "").lower().removeprefix("www.")
+        if hostname.endswith(".gov") or hostname.endswith(".edu") or hostname.endswith(".ac.in"):
+            return 0.85
+        if any(hostname == domain or hostname.endswith(f".{domain}") for domain in self.HIGH_RELIABILITY_DOMAINS):
+            return 0.82
+        return 0.72
 
 
 class FactChecker:
@@ -433,8 +548,21 @@ def get_fact_checker(
 ) -> FactChecker:
     """Get or create global FactChecker instance"""
     global _fact_checker
+    if search_provider is not None:
+        return FactChecker(search_provider=search_provider)
     if _fact_checker is None:
-        _fact_checker = FactChecker(search_provider=search_provider)
+        default_provider: FactCheckSearchProvider
+        if settings.SERPER_API_KEY:
+            default_provider = SerperFactCheckProvider(
+                api_key=settings.SERPER_API_KEY,
+                endpoint=settings.SERPER_SEARCH_ENDPOINT,
+                num_results=settings.SERPER_SEARCH_RESULTS,
+                gl=settings.SERPER_SEARCH_GL,
+                hl=settings.SERPER_SEARCH_HL,
+            )
+        else:
+            default_provider = MockFactCheckProvider()
+        _fact_checker = FactChecker(search_provider=default_provider)
     return _fact_checker
 
 

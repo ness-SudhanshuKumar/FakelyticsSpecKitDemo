@@ -44,7 +44,7 @@ class InMemoryRateLimiter:
         Reserve one request in the current daily window.
 
         Returns:
-            tuple: (remaining, limit, retry_after_seconds)
+            tuple: (remaining, limit, retry_after_seconds). Remaining is -1 when the request is rejected.
         """
         now = datetime.utcnow()
         day = self._window_key()
@@ -65,7 +65,7 @@ class InMemoryRateLimiter:
             current = self._usage.get(usage_key, 0)
             if current >= limit:
                 retry_after = int((self._reset_at[endpoint_key] - now).total_seconds())
-                return 0, limit, max(retry_after, 1)
+                return -1, limit, max(retry_after, 1)
 
             current += 1
             self._usage[usage_key] = current
@@ -123,11 +123,11 @@ def enforce_rate_limit(
     )
 
     response.headers["X-RateLimit-Limit"] = str(limit)
-    response.headers["X-RateLimit-Remaining"] = str(remaining)
+    response.headers["X-RateLimit-Remaining"] = str(max(0, remaining))
     response.headers["X-RateLimit-Reset"] = str(retry_after)
     response.headers["X-RateLimit-Tier"] = auth.tier
 
-    if remaining <= 0:
+    if remaining < 0:
         response.headers["Retry-After"] = str(retry_after)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -137,4 +137,3 @@ def enforce_rate_limit(
                 "details": {"tier": auth.tier, "retry_after": retry_after},
             },
         )
-
