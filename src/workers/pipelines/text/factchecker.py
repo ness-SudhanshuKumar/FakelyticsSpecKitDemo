@@ -261,6 +261,17 @@ class SerperFactCheckProvider(FactCheckSearchProvider):
         if not self.api_key:
             return []
 
+        self.logger.info(
+            "Starting Serper search",
+            extra={
+                "claim": claim[:160],
+                "endpoint": self.endpoint,
+                "num_results": self.num_results,
+                "gl": self.gl,
+                "hl": self.hl,
+            },
+        )
+
         payload = {
             "q": claim,
             "num": self.num_results,
@@ -276,7 +287,12 @@ class SerperFactCheckProvider(FactCheckSearchProvider):
             async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(self.endpoint, headers=headers, json=payload)
                 response.raise_for_status()
-                return self._parse_results(response.json())
+                evidence = self._parse_results(response.json())
+                self.logger.info(
+                    "Serper search completed",
+                    extra={"claim": claim[:160], "evidence_count": len(evidence)},
+                )
+                return evidence
         except Exception as exc:
             self.logger.warning("Serper search failed", extra={"claim": claim, "error": str(exc)})
             return []

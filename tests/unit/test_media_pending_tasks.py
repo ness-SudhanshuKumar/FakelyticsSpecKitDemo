@@ -51,6 +51,64 @@ def test_url_validation_blocks_private_and_reserved_hosts():
 
 
 @pytest.mark.asyncio
+async def test_parse_content_prefers_json_ld_article_body_over_page_noise():
+    service = ContentExtractionService()
+    article_body = " ".join(["Main verified article sentence about the policy decision."] * 12)
+    html = f"""
+    <html>
+      <head>
+        <script type="application/ld+json">
+        {{
+          "@type": "NewsArticle",
+          "headline": "Important policy decision",
+          "description": "Concise article summary",
+          "articleBody": "{article_body}"
+        }}
+        </script>
+      </head>
+      <body>
+        <nav>Home Politics Sports Entertainment</nav>
+        <aside>Related stories should not dominate extraction</aside>
+        <article><p>Short visible teaser.</p></article>
+      </body>
+    </html>
+    """
+
+    extract = await service._parse_content("https://example.com/story", html)
+
+    assert "Important policy decision" in extract.text_content
+    assert "Main verified article sentence" in extract.text_content
+    assert "Related stories" not in extract.text_content
+
+
+@pytest.mark.asyncio
+async def test_parse_content_removes_ads_and_related_from_semantic_article():
+    service = ContentExtractionService()
+    paragraph = " ".join(["The main report explains the event with enough detail for verification."] * 8)
+    html = f"""
+    <html>
+      <body>
+        <header>Site navigation</header>
+        <article>
+          <h1>Primary article headline</h1>
+          <div class="advertisement">Buy now unrelated ad text</div>
+          <p>{paragraph}</p>
+          <div class="related">Related suggestion should disappear</div>
+        </article>
+        <footer>Footer links</footer>
+      </body>
+    </html>
+    """
+
+    extract = await service._parse_content("https://example.com/story", html)
+
+    assert "Primary article headline" in extract.text_content
+    assert "main report explains" in extract.text_content
+    assert "Buy now" not in extract.text_content
+    assert "Related suggestion" not in extract.text_content
+
+
+@pytest.mark.asyncio
 async def test_parse_content_extracts_direct_audio_and_video_src():
     service = ContentExtractionService()
     html = """

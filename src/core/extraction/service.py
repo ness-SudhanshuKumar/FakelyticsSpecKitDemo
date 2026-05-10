@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import ipaddress
+import json
 import logging
 from typing import Optional, List
 from dataclasses import dataclass, field
@@ -11,6 +12,13 @@ from pathlib import Path
 import aiohttp
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
+
+try:
+    import trafilatura
+    TRAFILATURA_AVAILABLE = True
+except ImportError:
+    trafilatura = None
+    TRAFILATURA_AVAILABLE = False
 
 from src.core.config.settings import settings
 
@@ -228,8 +236,8 @@ class ContentExtractionService:
         try:
             soup = BeautifulSoup(html_content, 'html.parser')
 
-            # Extract text content
-            extract.text_content = self._extract_text(soup)
+            # Extract main article text first; fall back to broad page text.
+            extract.text_content = self._extract_text(soup, html_content)
 
             # Extract media URLs
             extract.images = self._extract_images(soup, url)
@@ -242,25 +250,192 @@ class ContentExtractionService:
 
         return extract
 
-    def _extract_text(self, soup: BeautifulSoup) -> str:
+    def _extract_text(self, soup: BeautifulSoup, html_content: str = "") -> str:
         """
-        Extract text content from HTML
+        Extract main article text from HTML.
         
         **Satisfies**: T-301 (Extract text and clean HTML tags)
         """
-        # Remove script and style elements
-        for script in soup(["script", "style"]):
-            script.decompose()
+        article_text = self._extract_article_text(html_content, soup)
+        if article_text:
+            return article_text[:10000]
 
-        # Get text
-        text = soup.get_text()
+        return self._extract_page_text_fallback(soup)[:10000]
 
-        # Clean up text
+    def _extract_article_text(self, html_content: str, soup: BeautifulSoup) -> str:
+        """Extract the central article body using trafilatura, JSON-LD, and semantic tags."""
+        if TRAFILATURA_AVAILABLE and html_content:
+            try:
+                extracted = trafilatura.extract(
+                    html_content,
+                    include_comments=False,
+                    include_tables=False,
+                    favor_precision=True,
+                )
+                cleaned = self._normalize_extracted_text(extracted or "")
+                if self._is_substantive_article_text(cleaned):
+                    logger.info("Extracted main article text with trafilatura", extra={"length": len(cleaned)})
+                    return cleaned
+            except Exception as exc:
+                logger.warning("Trafilatura extraction failed", extra={"error": str(exc)})
+
+        json_ld_text = self._extract_json_ld_article_text(soup)
+        if self._is_substantive_article_text(json_ld_text):
+            logger.info("Extracted main article text from JSON-LD", extra={"length": len(json_ld_text)})
+            return json_ld_text
+
+        semantic_text = self._extract_semantic_article_text(soup)
+        if self._is_substantive_article_text(semantic_text):
+            logger.info("Extracted main article text from semantic HTML", extra={"length": len(semantic_text)})
+            return semantic_text
+
+        return ""
+
+    def _extract_json_ld_article_text(self, soup: BeautifulSoup) -> str:
+        """Extract NewsArticle/Article headline and body from JSON-LD metadata."""
+        candidates: List[str] = []
+        for script in soup.find_all("script", type="application/ld+json"):
+            raw = script.string or script.get_text()
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            for item in self._iter_json_ld_items(data):
+                item_type = item.get("@type", "")
+                item_types = item_type if isinstance(item_type, list) else [item_type]
+                normalized_types = {str(value).lower() for value in item_types}
+                if not normalized_types.intersection({"article", "newsarticle", "blogposting"}):
+                    continue
+
+                parts = [
+                    item.get("headline"),
+                    item.get("description"),
+                    item.get("articleBody"),
+                ]
+                text = self._normalize_extracted_text(" ".join(str(part) for part in parts if part))
+                if text:
+                    candidates.append(text)
+
+        return max(candidates, key=len, default="")
+
+    def _iter_json_ld_items(self, data):
+        """Yield JSON-LD objects, including graph members."""
+        if isinstance(data, list):
+            for item in data:
+                yield from self._iter_json_ld_items(item)
+        elif isinstance(data, dict):
+            yield data
+            graph = data.get("@graph")
+            if isinstance(graph, list):
+                for item in graph:
+                    yield from self._iter_json_ld_items(item)
+
+    def _extract_semantic_article_text(self, soup: BeautifulSoup) -> str:
+        """Extract text from article-like containers after removing page chrome."""
+        working = BeautifulSoup(str(soup), "html.parser")
+        self._remove_non_article_elements(working)
+
+        selectors = [
+            "article",
+            "main",
+            "[role='main']",
+            ".article",
+            ".story",
+            ".story-content",
+            ".article-content",
+            ".post-content",
+            ".entry-content",
+            ".content-body",
+        ]
+        candidates = []
+        for selector in selectors:
+            for node in working.select(selector):
+                text = self._text_from_article_node(node)
+                if text:
+                    candidates.append(text)
+
+        return max(candidates, key=len, default="")
+
+    def _extract_page_text_fallback(self, soup: BeautifulSoup) -> str:
+        """Extract broad page text after removing common chrome and ad regions."""
+        working = BeautifulSoup(str(soup), "html.parser")
+        self._remove_non_article_elements(working)
+        return self._normalize_extracted_text(working.get_text(" "))
+
+    def _remove_non_article_elements(self, soup: BeautifulSoup) -> None:
+        """Remove navigation, ads, suggestions, and non-content elements."""
+        for node in soup([
+            "script",
+            "style",
+            "noscript",
+            "nav",
+            "footer",
+            "header",
+            "aside",
+            "form",
+            "iframe",
+            "svg",
+        ]):
+            node.decompose()
+
+        noise_terms = (
+            "ad",
+            "advert",
+            "breadcrumb",
+            "carousel",
+            "comment",
+            "footer",
+            "menu",
+            "nav",
+            "promo",
+            "recommend",
+            "related",
+            "share",
+            "sidebar",
+            "social",
+            "subscribe",
+            "suggest",
+            "trending",
+        )
+        for node in soup.find_all(True):
+            marker = " ".join(
+                str(value).lower()
+                for value in [
+                    node.get("id", ""),
+                    " ".join(node.get("class", [])),
+                    node.get("role", ""),
+                    node.get("aria-label", ""),
+                ]
+            )
+            if any(term in marker for term in noise_terms):
+                node.decompose()
+
+    def _text_from_article_node(self, node) -> str:
+        """Return normalized headline/paragraph text from a candidate article node."""
+        parts = []
+        for child in node.find_all(["h1", "h2", "p"], recursive=True):
+            text = self._normalize_extracted_text(child.get_text(" "))
+            if len(text) >= 25 or child.name in {"h1", "h2"}:
+                parts.append(text)
+        if not parts:
+            return self._normalize_extracted_text(node.get_text(" "))
+        return self._normalize_extracted_text(" ".join(parts))
+
+    def _normalize_extracted_text(self, text: str) -> str:
+        """Normalize extracted article text."""
+        if not text:
+            return ""
+
         lines = (line.strip() for line in text.splitlines())
         chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        text = ' '.join(chunk for chunk in chunks if chunk)
+        return ' '.join(chunk for chunk in chunks if chunk)
 
-        return text[:10000]  # Limit to first 10k chars for now
+    def _is_substantive_article_text(self, text: str) -> bool:
+        """Check whether extracted text is article-like enough to trust."""
+        words = text.split()
+        return len(words) >= 25 and len(text) >= 160
 
     def _extract_images(self, soup: BeautifulSoup, base_url: str) -> List[MediaItem]:
         """Extract image URLs"""
