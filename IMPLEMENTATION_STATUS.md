@@ -248,10 +248,10 @@ FakelyticsSpecKitDemo/
 
 1. **Mock Reports**: Current /verify returns mock data; real pipelines coming
 2. **In-Memory Storage**: No persistence; will add PostgreSQL in Phase 2
-3. **No Authentication**: API key support queued (T-105)
-4. **No Rate Limiting**: Per-user limits queued (T-106)
-5. **No Webhook Callbacks**: Async mode returns 202 but doesn't POST yet (T-104)
-6. **No Media Storage**: Media downloads not implemented yet (T-202)
+3. **No PostgreSQL Persistence**: Reports are stored in memory for MVP (T-802 pending)
+4. **No S3 Storage**: Media downloads use local storage for MVP (T-202 production S3 pending)
+5. **Reverse Image Search Not Configured**: Image source lookup via external APIs is still pending (T-402)
+6. **Deepfake ML Model Not Integrated**: Audio/video analysis uses MVP heuristics (T-502 pending)
 7. **Single-Node Deployment**: No clustering yet
 
 ### Design Decisions
@@ -268,12 +268,11 @@ FakelyticsSpecKitDemo/
 
 ### Immediate Next Tasks (Recommended Order)
 
-1. **T-202**: Media Download & Storage (S3 integration)
-2. **T-301-T-304**: Text Verification Pipeline
-   - T-301: Text extraction and preprocessing
-   - T-302: Fact-checking with external APIs
-   - T-303: NLP-based analysis
-   - T-304: Evidence validation
+1. **T-402**: Reverse image search
+2. **T-502**: Deepfake detection model integration
+3. **T-802**: Database persistence
+4. **T-803**: Report formatting/export
+5. **T-603**: Network analysis
 
 3. **T-401-T-403**: Image Verification Pipeline
    - T-401: Image manipulation detection

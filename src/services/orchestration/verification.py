@@ -23,6 +23,7 @@ from src.workers.pipelines.audio_video import analyze_audio_video
 from src.workers.pipelines.image import analyze_images
 from src.workers.pipelines.spam import analyze_spam_and_source
 from src.workers.pipelines.text.factchecker import ClaimFinding, get_fact_checker
+from src.workers.pipelines.text.nlp_analyzer import NLPFinding, get_nlp_analyzer
 from src.workers.pipelines.text.preprocessor import get_preprocessor
 
 
@@ -54,6 +55,49 @@ async def _convert_claim_finding(claim_finding: ClaimFinding) -> Finding:
     )
 
 
+def _convert_nlp_finding(nlp_finding: NLPFinding) -> Finding:
+    """Convert NLP language-pattern analysis into the API finding model."""
+    return Finding(
+        summary=nlp_finding.summary,
+        verdict=_verdict_from_text(nlp_finding.verdict.value),
+        confidence=max(0, min(100, int(nlp_finding.confidence))),
+        evidence=[],
+        details={
+            "pipeline": "text_nlp",
+            "language_indicators": nlp_finding.language_indicators,
+            "recommendation": nlp_finding.recommendation,
+            "patterns": [pattern.to_dict() for pattern in nlp_finding.patterns],
+        },
+    )
+
+
+def _is_unverified_factcheck(finding: Finding) -> bool:
+    """Return True when a fact-check finding has no external evidence."""
+    return (
+        finding.details is not None
+        and finding.details.get("pipeline") == "text_factcheck"
+        and finding.verdict == Verdict.UNVERIFIABLE
+        and not finding.evidence
+    )
+
+
+def _select_text_verdict(findings: List[Finding]) -> tuple[Verdict, int]:
+    """Select a text verdict without letting no-evidence fact checks erase NLP analysis."""
+    disputed = [item for item in findings if item.verdict == Verdict.DISPUTED]
+    if disputed:
+        return Verdict.DISPUTED, int(mean(item.confidence for item in disputed))
+
+    supported = [item for item in findings if item.verdict == Verdict.SUPPORTED]
+    if supported:
+        evidence_backed = [item for item in supported if item.evidence]
+        selected = evidence_backed or supported
+        return Verdict.SUPPORTED, int(mean(item.confidence for item in selected))
+
+    actionable = [item for item in findings if not _is_unverified_factcheck(item)]
+    selected = actionable or findings
+    return Verdict.UNVERIFIABLE, int(mean(item.confidence for item in selected))
+
+
 async def _build_text_result(content: ContentExtract) -> PipelineResult:
     preprocessor = get_preprocessor()
     preprocessed = preprocessor.extract_and_preprocess(content)
@@ -63,10 +107,15 @@ async def _build_text_result(content: ContentExtract) -> PipelineResult:
         preprocessed,
         timeout=settings.PIPELINE_TIMEOUT,
     )
+    nlp_finding = await get_nlp_analyzer().analyze_preprocessed(
+        preprocessed,
+        timeout=settings.PIPELINE_TIMEOUT,
+    )
 
     converted_findings: List[Finding] = []
     for item in claim_findings:
         converted_findings.append(await _convert_claim_finding(item))
+    converted_findings.append(_convert_nlp_finding(nlp_finding))
 
     if not converted_findings:
         return PipelineResult(
@@ -83,15 +132,7 @@ async def _build_text_result(content: ContentExtract) -> PipelineResult:
             ],
         )
 
-    verdicts = [item.verdict for item in converted_findings]
-    if Verdict.DISPUTED in verdicts and verdicts.count(Verdict.DISPUTED) >= verdicts.count(Verdict.SUPPORTED):
-        final_verdict = Verdict.DISPUTED
-    elif Verdict.SUPPORTED in verdicts:
-        final_verdict = Verdict.SUPPORTED
-    else:
-        final_verdict = Verdict.UNVERIFIABLE
-
-    confidence = int(mean(item.confidence for item in converted_findings))
+    final_verdict, confidence = _select_text_verdict(converted_findings)
     return PipelineResult(verdict=final_verdict, confidence=confidence, findings=converted_findings)
 
 
@@ -124,4 +165,3 @@ async def build_credibility_report(
         findings=findings,
         timestamp=datetime.utcnow(),
     )
-

@@ -1,8 +1,10 @@
 """Content extraction service for fetching and extracting content from URLs"""
 
 import asyncio
+import hashlib
+import ipaddress
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +24,10 @@ class MediaItem:
     media_type: str  # 'image', 'audio', 'video'
     title: Optional[str] = None
     local_path: Optional[str] = None
+    storage_path: Optional[str] = None
+    content_type: Optional[str] = None
     size_bytes: Optional[int] = None
+    download_error: Optional[str] = None
     extracted_at: datetime = field(default_factory=datetime.utcnow)
 
 
@@ -69,6 +74,12 @@ class ContentExtractionService:
     IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp'}
     AUDIO_EXTENSIONS = {'.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac'}
     VIDEO_EXTENSIONS = {'.mp4', '.webm', '.mov', '.avi', '.mkv', '.flv', '.m3u8'}
+    MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
+    MEDIA_CONTENT_PREFIXES = {
+        "image": ("image/",),
+        "audio": ("audio/",),
+        "video": ("video/", "application/vnd.apple.mpegurl"),
+    }
 
     # Headers to mimic browser
     DEFAULT_HEADERS = {
@@ -80,7 +91,7 @@ class ContentExtractionService:
         self.timeout = aiohttp.ClientTimeout(total=settings.CONTENT_EXTRACTION_TIMEOUT)
         self.max_content_size = settings.MAX_CONTENT_SIZE
         self.media_dir = Path(settings.DOWNLOADED_MEDIA_DIR)
-        self.media_dir.mkdir(exist_ok=True)
+        self.media_dir.mkdir(parents=True, exist_ok=True)
 
     async def extract(self, url: str) -> ContentExtract:
         """
@@ -110,6 +121,9 @@ class ContentExtractionService:
 
         # Parse content
         extract = await self._parse_content(url, html_content)
+
+        if settings.DOWNLOAD_EXTRACTED_MEDIA:
+            await self._download_extracted_media(extract)
         
         logger.info(f"Successfully extracted content from {url}")
         return extract
@@ -123,9 +137,6 @@ class ContentExtractionService:
         if not isinstance(url, str):
             raise URLValidationError("URL must be a string")
 
-        if not url.startswith(("http://", "https://")):
-            raise URLValidationError("URL must start with http:// or https://")
-
         if len(url) > 2048:
             raise URLValidationError("URL too long (max 2048 characters)")
 
@@ -135,16 +146,37 @@ class ContentExtractionService:
         except Exception as e:
             raise URLValidationError(f"Invalid URL format: {str(e)}")
 
-        # Check for private IPs (basic check)
+        if parsed.scheme not in {"http", "https"}:
+            raise URLValidationError("URL must start with http:// or https://")
+
         hostname = parsed.hostname
-        if hostname:
-            # Block common private IP patterns
-            private_patterns = [
-                '127.', '192.168.', '10.', '172.16.', '172.17.',
-                'localhost', '0.0.0.0'
-            ]
-            if any(hostname.startswith(p) for p in private_patterns):
-                raise URLValidationError("URLs to private IP addresses are blocked")
+        if not hostname:
+            raise URLValidationError("URL must include a valid hostname")
+
+        if parsed.username or parsed.password:
+            raise URLValidationError("URLs with embedded credentials are blocked")
+
+        if hostname.lower() in {"localhost", "localhost.localdomain"}:
+            raise URLValidationError("URLs to private hosts are blocked")
+
+        try:
+            ip = ipaddress.ip_address(hostname.strip("[]"))
+        except ValueError:
+            if "." not in hostname:
+                raise URLValidationError("URL must include a fully qualified domain name")
+            return
+
+        if any(
+            (
+                ip.is_private,
+                ip.is_loopback,
+                ip.is_link_local,
+                ip.is_multicast,
+                ip.is_reserved,
+                ip.is_unspecified,
+            )
+        ):
+            raise URLValidationError("URLs to private or reserved IP addresses are blocked")
 
     async def _fetch_url(self, url: str, max_retries: int = 3) -> str:
         """
@@ -251,6 +283,13 @@ class ContentExtractionService:
         
         # Find audio tags
         for audio in soup.find_all('audio', limit=20):
+            src = audio.get('src')
+            if src:
+                audio_items.append(MediaItem(
+                    url=urljoin(base_url, src),
+                    media_type='audio',
+                    title=audio.get('title', 'Audio')
+                ))
             for source in audio.find_all('source'):
                 src = source.get('src')
                 if src:
@@ -269,6 +308,13 @@ class ContentExtractionService:
         
         # Find video tags
         for video in soup.find_all('video', limit=20):
+            src = video.get('src')
+            if src:
+                videos.append(MediaItem(
+                    url=urljoin(base_url, src),
+                    media_type='video',
+                    title=video.get('title', 'Video')
+                ))
             for source in video.find_all('source'):
                 src = source.get('src')
                 if src:
@@ -290,6 +336,82 @@ class ContentExtractionService:
                 ))
         
         return videos
+
+    async def _download_extracted_media(self, extract: ContentExtract) -> None:
+        """Download a bounded number of extracted media assets to local object-store style paths."""
+        media_items = (extract.images + extract.audio + extract.video)[: settings.MEDIA_DOWNLOAD_LIMIT]
+        if not media_items:
+            return
+
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            await asyncio.gather(
+                *(self.download_media_item(session, item) for item in media_items),
+                return_exceptions=True,
+            )
+
+    async def download_media_item(self, session: aiohttp.ClientSession, item: MediaItem) -> MediaItem:
+        """Download and validate one media item.
+
+        The MVP stores files locally under DOWNLOADED_MEDIA_DIR while exposing a stable
+        ``storage_path`` that mirrors the object key shape expected from S3-backed storage.
+        """
+        try:
+            self._validate_url(item.url)
+            extension = self._extension_for_url(item.url)
+            if extension not in self._extensions_for_type(item.media_type):
+                raise ContentFetchError(f"Unsupported {item.media_type} file type")
+
+            async with session.get(item.url, headers=self.DEFAULT_HEADERS, ssl=False) as response:
+                if response.status >= 400:
+                    raise ContentFetchError(f"HTTP {response.status}")
+
+                content_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
+                if content_type and not self._content_type_matches(item.media_type, content_type):
+                    raise ContentFetchError(f"Unexpected content type: {content_type}")
+
+                content_length = response.headers.get("Content-Length")
+                if content_length and int(content_length) > settings.MAX_MEDIA_FILE_SIZE:
+                    raise ContentFetchError("Media file exceeds size limit")
+
+                data = await response.read()
+                if len(data) > settings.MAX_MEDIA_FILE_SIZE:
+                    raise ContentFetchError("Media file exceeds size limit")
+                if not data:
+                    raise ContentFetchError("Media file is empty")
+
+            digest = hashlib.sha256(item.url.encode("utf-8")).hexdigest()[:20]
+            media_dir = self.media_dir / item.media_type
+            media_dir.mkdir(parents=True, exist_ok=True)
+            file_path = media_dir / f"{digest}{extension}"
+            file_path.write_bytes(data)
+
+            item.local_path = str(file_path)
+            item.storage_path = f"media/{item.media_type}/{file_path.name}"
+            item.content_type = content_type or None
+            item.size_bytes = len(data)
+            item.download_error = None
+        except Exception as exc:
+            item.download_error = str(exc)
+            logger.warning("Media download failed", extra={"url": item.url, "error": item.download_error})
+
+        return item
+
+    def _extension_for_url(self, url: str) -> str:
+        """Return lowercase extension from a media URL path."""
+        return Path(urlparse(url).path).suffix.lower()
+
+    def _extensions_for_type(self, media_type: str) -> set[str]:
+        if media_type == "image":
+            return self.IMAGE_EXTENSIONS
+        if media_type == "audio":
+            return self.AUDIO_EXTENSIONS
+        if media_type == "video":
+            return self.VIDEO_EXTENSIONS
+        return set()
+
+    def _content_type_matches(self, media_type: str, content_type: str) -> bool:
+        prefixes = self.MEDIA_CONTENT_PREFIXES.get(media_type, ())
+        return any(content_type.startswith(prefix) for prefix in prefixes)
 
 
 # Global instance

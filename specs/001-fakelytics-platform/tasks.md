@@ -78,6 +78,7 @@
   - Per-key rate limiting
 - **Complexity**: S
 - **Dependencies**: T-105
+- **Status**: ✅ COMPLETE (per-key daily quota with last-request edge case covered)
 
 ---
 
@@ -109,6 +110,7 @@
 - **Complexity**: M
 - **Dependencies**: T-201
 - **Blocked By**: T-201
+- **Status**: ✅ MVP COMPLETE (bounded local object-store style media downloads)
 
 #### T-203: Implement URL Validation & Security
 - **Description**: Validate URLs for malicious content and accessibility.
@@ -120,6 +122,7 @@
   - Integrates with threat intelligence if available
 - **Complexity**: S
 - **Dependencies**: T-201
+- **Status**: ✅ MVP COMPLETE (scheme, hostname, credentials, and private/reserved IP blocking)
 
 ---
 
@@ -149,6 +152,7 @@
 - **Complexity**: L
 - **Dependencies**: T-301, T-201
 - **Blocked By**: T-301
+- **Status**: ✅ COMPLETE (Serper web search provider with mock fallback)
 
 #### T-303: Implement NLP-Based Analysis
 - **Description**: Use NLP models to detect misinformation patterns, bias, and credibility signals in text.
@@ -189,6 +193,7 @@
 - **Complexity**: L
 - **Dependencies**: T-202, T-201
 - **Blocked By**: T-202
+- **Status**: ✅ MVP COMPLETE (metadata/download heuristics; external ML pending for Phase 2)
 
 #### T-402: Implement Reverse Image Search
 - **Description**: Search for image sources and context.
@@ -210,6 +215,7 @@
   - Returns forensic findings with evidence
 - **Complexity**: M
 - **Dependencies**: T-401
+- **Status**: ✅ MVP COMPLETE (file type, content type, and download integrity signals)
 
 ---
 
@@ -225,6 +231,7 @@
 - **Complexity**: L
 - **Dependencies**: T-202, T-201
 - **Blocked By**: T-202
+- **Status**: ✅ MVP COMPLETE (container metadata/file-size features for downloaded assets)
 
 #### T-502: Implement Deepfake Detection Model
 - **Description**: Use ML models to detect synthetic/manipulated audio and video.
@@ -247,6 +254,7 @@
   - Returns evidence with timestamps and confidence
 - **Complexity**: M
 - **Dependencies**: T-502
+- **Status**: ✅ MVP COMPLETE (stored media evidence and suspicious marker reporting)
 
 ---
 
@@ -620,20 +628,20 @@ Testing Layer (Parallel after implementation):
 | T-103 | ✅ Complete | P1 | M | P0 |
 | T-104 | Not Started | P1 | M | P1 |
 | T-105 | Not Started | P1 | M | P0 |
-| T-106 | Not Started | P1 | S | P0 |
+| T-106 | ✅ Complete | P1 | S | P0 |
 | T-201 | ✅ Complete | P1 | L | P0 |
-| T-202 | Not Started | P1 | M | P0 |
-| T-203 | Not Started | P1 | S | P0 |
+| T-202 | ✅ MVP Complete | P1 | M | P0 |
+| T-203 | ✅ MVP Complete | P1 | S | P0 |
 | T-301 | ✅ Complete | P1 | M | P0 |
 | T-302 | ✅ Complete | P1 | L | P0 |
 | T-303 | ✅ Complete | P1 | L | P0 |
 | T-304 | ✅ Complete | P1 | M | P1 |
-| T-401 | Not Started | P1 | L | P0 |
+| T-401 | ✅ MVP Complete | P1 | L | P0 |
 | T-402 | Not Started | P1 | M | P1 |
-| T-403 | Not Started | P1 | M | P1 |
-| T-501 | Not Started | P2 | L | P1 |
+| T-403 | ✅ MVP Complete | P1 | M | P1 |
+| T-501 | ✅ MVP Complete | P2 | L | P1 |
 | T-502 | Not Started | P2 | L | P1 |
-| T-503 | Not Started | P2 | M | P1 |
+| T-503 | ✅ MVP Complete | P2 | M | P1 |
 | T-601 | Not Started | P1 | M | P0 |
 | T-602 | Not Started | P1 | M | P0 |
 | T-603 | Not Started | P2 | M | P1 |

@@ -15,6 +15,7 @@ from src.workers.pipelines.text.factchecker import (
     ClaimExtractor,
     FactChecker,
     MockFactCheckProvider,
+    SerperFactCheckProvider,
     get_claim_extractor,
     get_fact_checker,
 )
@@ -190,6 +191,52 @@ class TestMockFactCheckProvider:
             assert e.url
             assert e.snippet
             assert e.source
+
+
+class TestSerperFactCheckProvider:
+    """Test Serper web-search provider without making network calls."""
+
+    def test_parse_results_returns_evidence(self):
+        provider = SerperFactCheckProvider(api_key="test-key", num_results=2)
+        data = {
+            "organic": [
+                {
+                    "title": "Official statement",
+                    "link": "https://pib.gov.in/example",
+                    "snippet": "The government announced the floor test date.",
+                    "date": "May 10, 2026",
+                },
+                {
+                    "title": "News report",
+                    "link": "https://example-news.com/story",
+                    "snippet": "The report contains matching context.",
+                },
+            ]
+        }
+
+        evidence = provider._parse_results(data)
+
+        assert len(evidence) == 2
+        assert evidence[0].url == "https://pib.gov.in/example"
+        assert evidence[0].reliability_score >= 0.8
+        assert evidence[1].source == "example-news.com"
+
+    def test_parse_results_skips_incomplete_items(self):
+        provider = SerperFactCheckProvider(api_key="test-key")
+        data = {
+            "organic": [
+                {"title": "Missing URL", "snippet": "Snippet only"},
+                {"link": "https://example.com/no-snippet"},
+            ]
+        }
+
+        assert provider._parse_results(data) == []
+
+    def test_get_fact_checker_with_provider_does_not_reuse_singleton(self):
+        provider = MockFactCheckProvider()
+        checker = get_fact_checker(search_provider=provider)
+
+        assert checker.search_provider is provider
 
 
 class TestFactChecker:

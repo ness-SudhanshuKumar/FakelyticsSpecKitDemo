@@ -53,10 +53,18 @@ class Settings(BaseSettings):
     CONTENT_EXTRACTION_TIMEOUT: int = 30
     MAX_CONTENT_SIZE: int = 500 * 1024 * 1024  # 500MB
     DOWNLOADED_MEDIA_DIR: str = "extracted_media"
+    DOWNLOAD_EXTRACTED_MEDIA: bool = True
+    MEDIA_DOWNLOAD_LIMIT: int = 10
+    MAX_MEDIA_FILE_SIZE: int = 25 * 1024 * 1024  # 25MB per media asset
 
     # External Services
     OPENAI_API_KEY: Optional[str] = None
     SERPAPI_KEY: Optional[str] = None
+    SERPER_API_KEY: Optional[str] = None
+    SERPER_SEARCH_ENDPOINT: str = "https://google.serper.dev/search"
+    SERPER_SEARCH_RESULTS: int = 5
+    SERPER_SEARCH_GL: str = "in"
+    SERPER_SEARCH_HL: str = "en"
 
     # Feature Flags
     ENABLE_ASYNC_MODE: bool = True
