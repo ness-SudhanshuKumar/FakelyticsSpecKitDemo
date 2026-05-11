@@ -24,7 +24,7 @@ import httpx
 
 from src.core.config.settings import settings
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("fakelytics.factchecker")
 
 
 class Verdict(str, Enum):
