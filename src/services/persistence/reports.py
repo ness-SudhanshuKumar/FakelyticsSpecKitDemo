@@ -13,6 +13,11 @@ from src.api.models.schemas import CredibilityReport, RequestStatus
 logger = logging.getLogger(__name__)
 
 
+class ReportNotFoundError(Exception):
+    """Raised when a report is not found in storage."""
+    pass
+
+
 class ReportPersistence:
     """Service for persisting and retrieving credibility reports from database."""
 
@@ -73,27 +78,32 @@ class ReportPersistence:
             request_id: Request ID to retrieve
             
         Returns:
-            Report dict if found, None otherwise
+            Report dict if found
+            
+        Raises:
+            ReportNotFoundError: If report not found or expired
         """
         try:
             report_id_str = str(request_id)
             report_dict = self._reports.get(report_id_str)
             
             if not report_dict:
-                return None
+                raise ReportNotFoundError(f"Report not found for request {request_id}")
             
             # Check retention policy
             retention_expires = datetime.fromisoformat(report_dict.get("retention_expires_at", ""))
             if datetime.utcnow() > retention_expires:
                 logger.info(f"Report expired for request {request_id}")
                 del self._reports[report_id_str]
-                return None
+                raise ReportNotFoundError(f"Report expired for request {request_id}")
             
             return report_dict
             
+        except ReportNotFoundError:
+            raise
         except Exception as e:
             logger.error(f"Error retrieving report: {str(e)}")
-            return None
+            raise ReportNotFoundError(f"Error retrieving report for request {request_id}: {str(e)}")
 
     def delete_report(self, request_id: UUID) -> bool:
         """

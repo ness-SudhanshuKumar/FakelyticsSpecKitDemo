@@ -60,7 +60,7 @@ class MediaStorage:
         """Initialize media storage service."""
         self.storage_base = Path(settings.DOWNLOADED_MEDIA_DIR)
         self.storage_base.mkdir(parents=True, exist_ok=True)
-        self.timeout = aiohttp.ClientTimeout(total=settings.MEDIA_DOWNLOAD_TIMEOUT)
+        self.timeout = aiohttp.ClientTimeout(total=settings.CONTENT_EXTRACTION_TIMEOUT)
 
     def _get_max_size(self, media_type: str) -> int:
         """Get maximum file size for media type."""
