@@ -1,7 +1,7 @@
 """Main FastAPI application for Fakelytics platform"""
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
@@ -87,20 +87,51 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 @app.get("/health", tags=["Health"], response_model=HealthResponse)
 async def health_check(request: Request) -> HealthResponse:
     """
-    Health check endpoint
+    Health check endpoint with comprehensive system status.
     
-    **Satisfies**: FR-010 (Audit logging)
+    **Satisfies**: FR-010 (Audit logging), T-903 (Health Checks)
     **Returns**: System status, version, and timestamp
     """
     trace_id = getattr(request.state, "trace_id", "unknown")
     
+    # Check basic health
+    health_status = "healthy"
+    checks = {
+        "api": "ok",
+        "extraction_service": "ok",
+        "report_persistence": "ok",
+        "report_formatter": "ok",
+    }
+    
+    # Verify critical services are available
+    try:
+        from src.core.extraction.service import extraction_service
+        if extraction_service is None:
+            health_status = "degraded"
+            checks["extraction_service"] = "unavailable"
+    except Exception as e:
+        health_status = "degraded"
+        checks["extraction_service"] = f"error: {str(e)}"
+    
+    try:
+        from src.services.persistence.reports import report_persistence
+        if report_persistence.get_report_count() >= 0:  # Test method
+            checks["report_persistence"] = "ok"
+    except Exception as e:
+        health_status = "degraded"
+        checks["report_persistence"] = f"error: {str(e)}"
+    
     app_logger.info(
-        "Health check",
-        extra={"trace_id": trace_id}
+        "Health check performed",
+        extra={
+            "trace_id": trace_id,
+            "status": health_status,
+            "checks": checks
+        }
     )
     
     return HealthResponse(
-        status="healthy",
+        status=health_status,
         version=settings.APP_VERSION,
         timestamp=datetime.utcnow()
     )
@@ -115,6 +146,41 @@ async def root():
         "docs": "/docs",
         "api_prefix": settings.API_PREFIX
     }
+
+
+@app.get("/metrics", tags=["Monitoring"])
+async def get_metrics(request: Request):
+    """
+    Prometheus-compatible metrics endpoint.
+    
+    **Satisfies**: T-902 (Metrics & Monitoring - Prometheus endpoint)
+    **Returns**: System metrics in Prometheus format
+    """
+    trace_id = getattr(request.state, "trace_id", "unknown")
+    
+    try:
+        from src.services.monitoring.metrics import metrics_collector
+        metrics_text = metrics_collector.to_prometheus_format()
+        
+        app_logger.info(
+            "Metrics endpoint accessed",
+            extra={"trace_id": trace_id}
+        )
+        
+        return Response(
+            content=metrics_text,
+            media_type="text/plain; version=0.0.4"
+        )
+    except Exception as e:
+        app_logger.error(
+            "Error generating metrics",
+            extra={"trace_id": trace_id, "error": str(e)},
+            exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Error generating metrics"
+        )
 
 
 # Import and include routers

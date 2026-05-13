@@ -13,11 +13,13 @@ from pythonjsonlogger import jsonlogger
 def setup_json_logger(logger_name: str) -> logging.Logger:
     """Set up JSON logger for structured logging"""
     logger = logging.getLogger(logger_name)
-    logHandler = logging.StreamHandler()
-    formatter = jsonlogger.JsonFormatter()
-    logHandler.setFormatter(formatter)
-    logger.addHandler(logHandler)
+    if not logger.handlers:
+        logHandler = logging.StreamHandler()
+        formatter = jsonlogger.JsonFormatter()
+        logHandler.setFormatter(formatter)
+        logger.addHandler(logHandler)
     logger.setLevel(logging.INFO)
+    logger.propagate = False
     return logger
 
 
